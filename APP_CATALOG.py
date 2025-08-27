@@ -1,20 +1,40 @@
+# -*- coding: utf-8 -*-
+"""
+Validador de Catalogación (simple.ripley.cl) con soporte de COOKIES
+-------------------------------------------------------------------
+- Carga cookies desde:
+    1) Variable de entorno COOKIE_HEADER (formato: "k1=v1; k2=v2; ...")
+    2) Variable de entorno COOKIES_JSON (formato JSON: {"k1":"v1","k2":"v2"})
+    3) Campo de texto en la UI (no se guarda; útil para pruebas)
+- Realiza búsqueda PLP -> encuentra primer PDP -> extrae taxonomía (breadcrumb)
+  desde JSON-LD, microdatos, dataLayer o DOM.
+- Regla: ≥2 niveles útiles y sin "miscel/otros/varios" = "Sí, catalogado".
+- Si el breadcrumb trae solo "Home/Inicio", marca "No catalogado" con observación.
+
+IMPORTANTE:
+- No subas tus cookies al repo. Usa .env (local/colab) o pega el header en la UI.
+"""
+
+import os
 import re
-import time
-import csv
 import io
+import csv
 import json
+import time
 import random
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urljoin
 
-import streamlit as st
 import requests
 from bs4 import BeautifulSoup
+import streamlit as st
 
-# ===== Configuración solo para simple.ripley.cl =====
+# ===== Configuración dominio =====
 DOMAIN = "https://simple.ripley.cl"
 SEARCH_PATH = "/busca?Ntt={q}"
 TIMEOUT = 25
+
+# ===== Headers base =====
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -27,12 +47,55 @@ HEADERS = {
     "DNT": "1",
     "Upgrade-Insecure-Requests": "1",
 }
-MISC_PAT = re.compile(r"(otros|miscel|varios|variedad|otros productos)", re.IGNORECASE)
 
-# Palabras de ruido que no cuentan como nivel de categoría
-HOME_NOISE = {
-    "home", "inicio", "búsqueda", "busqueda", "resultados", "search", "results"
-}
+MISC_PAT = re.compile(r"(otros|miscel|varios|variedad|otros productos)", re.IGNORECASE)
+HOME_NOISE = {"home", "inicio", "búsqueda", "busqueda", "resultados", "search", "results"}
+
+# ===== Helpers COOKIES =====
+def load_dotenv_if_available() -> None:
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv()
+    except Exception:
+        pass  # opcional
+
+def parse_cookie_header(cookie_header: str) -> Dict[str, str]:
+    """
+    Convierte: 'k1=v1; k2=v2; k3=v3' -> {"k1":"v1","k2":"v2","k3":"v3"}
+    Ignora espacios/pares vacíos.
+    """
+    out = {}
+    for part in cookie_header.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k:
+                out[k] = v
+    return out
+
+def get_cookies_from_env() -> Dict[str, str]:
+    """
+    Carga cookies desde:
+      - COOKIE_HEADER (string tipo header)
+      - COOKIES_JSON (JSON dict)
+    Se pueden usar ambas; COOKIES_JSON sobreescribe claves de COOKIE_HEADER.
+    """
+    cookies: Dict[str, str] = {}
+    header = os.getenv("COOKIE_HEADER", "").strip()
+    if header:
+        cookies.update(parse_cookie_header(header))
+    js = os.getenv("COOKIES_JSON", "").strip()
+    if js:
+        try:
+            obj = json.loads(js)
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        cookies[k] = v
+        except Exception:
+            pass
+    return cookies
 
 # ===== Utilidades =====
 def candidate_skus(s: str) -> List[str]:
@@ -44,88 +107,35 @@ def candidate_skus(s: str) -> List[str]:
             cands.append(base)
     return cands
 
-def session_get(url: str, session: Optional[requests.Session] = None) -> Optional[requests.Response]:
-    sess = session or requests.Session()
+def new_session(cookies: Optional[Dict[str, str]]) -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    if cookies:
+        s.cookies.update(cookies)
+    return s
+
+def session_get(url: str, session: requests.Session) -> Optional[requests.Response]:
     try:
-        r = sess.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
+        r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
         if r.status_code == 200 and r.text:
             return r
     except requests.RequestException:
         return None
     return None
 
-def pw_available() -> bool:
-    try:
-        import importlib
-        importlib.import_module("playwright.sync_api")
-        return True
-    except Exception:
-        return False
-
-# ===== Playwright helpers =====
-def get_html_with_playwright(url: str) -> Optional[str]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=HEADERS["User-Agent"])
-            page = context.new_page()
-            page.goto(url, wait_until="networkidle", timeout=50000)
-            html = page.content()
-            context.close()
-            browser.close()
-            return html
-    except Exception:
-        return None
-
-def get_pdp_html_via_playwright_from_search(search_url: str) -> Tuple[Optional[str], Optional[str]]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None, None
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=HEADERS["User-Agent"])
-            page = context.new_page()
-            page.goto(search_url, wait_until="networkidle", timeout=50000)
-            sel = 'a[href*="-p"], a[href*="/p/"]'
-            el = page.query_selector(sel)
-            if not el:
-                context.close()
-                browser.close()
-                return None, None
-            href = el.get_attribute("href")
-            if href:
-                pdp_url = urljoin(DOMAIN, href)
-                page.goto(pdp_url, wait_until="networkidle", timeout=50000)
-                html = page.content()
-                context.close()
-                browser.close()
-                return pdp_url, html
-            context.close()
-            browser.close()
-            return None, None
-    except Exception:
-        return None, None
-
-# ===== Extractores de taxonomía =====
+# ===== Parsers JSON-LD/Microdata/DOM/DataLayer =====
 def _iter_jsonld_blocks(soup: BeautifulSoup):
     for s in soup.find_all("script", type="application/ld+json"):
         txt = s.string or ""
         if not txt.strip():
             continue
-        # Caso normal
         try:
             data = json.loads(txt)
             yield data
             continue
         except Exception:
             pass
-        # A veces vienen múltiples JSON en líneas
+        # varias líneas con JSON sueltos
         for line in txt.splitlines():
             line = line.strip()
             if not line:
@@ -197,7 +207,6 @@ def extract_breadcrumb_from_microdata(html: str) -> List[str]:
     return [n for n in names if n.lower() not in {"home", "inicio"}]
 
 def extract_category_from_datalayer(html: str) -> Optional[str]:
-    # dataLayer o estructuras similares
     m = re.search(r"dataLayer\s*=\s*(\[[\s\S]*?\])", html)
     if not m:
         m = re.search(r"vtex[\s\S]{0,50}=\s*(\{[\s\S]*?\});", html)
@@ -242,10 +251,6 @@ def extract_breadcrumb_from_dom(html: str) -> List[str]:
     return []
 
 def extract_any_taxonomy(html: str) -> Tuple[List[str], str]:
-    """
-    Devuelve (niveles, fuente) donde fuente ∈
-    {jsonld_breadcrumb, jsonld_product, microdata, datalayer, dom, none}
-    """
     crumbs = extract_breadcrumb_from_jsonld(html)
     if crumbs:
         return crumbs, "jsonld_breadcrumb"
@@ -267,15 +272,9 @@ def extract_any_taxonomy(html: str) -> Tuple[List[str], str]:
         return dom, "dom"
     return [], "none"
 
-# ===== Normalización / regla de catalogación =====
+# ===== Normalización / Regla =====
 def normalize_crumbs(raw_crumbs: List[str]) -> Tuple[List[str], bool]:
-    """
-    1) Quita tokens vacíos, separadores y 'home/inicio/búsqueda/resultados'
-    2) Colapsa duplicados consecutivos
-    Devuelve (limpios, solo_home_flag)
-    """
-    cleaned = []
-    had_any = False
+    cleaned, had_any = [], False
     for c in raw_crumbs:
         if c is None:
             continue
@@ -314,57 +313,42 @@ def resolve_first_pdp_url_from_search_html(html: str) -> Optional[str]:
         return meta["content"]
     return None
 
-def best_effort_pdp_for_sku(sku: str, use_playwright: bool, session: requests.Session) -> tuple:
+def best_effort_pdp_for_sku_with_cookies(sku: str, cookies: Dict[str, str]) -> tuple:
     """
-    Busca el SKU, localiza la PDP y retorna:
-    (pdp_url, pdp_html, crumbs_raw, fuente, modo)
-    modo ∈ {"requests", "playwright", "none"}
+    Busca con SESSION (que lleva tus cookies):
+    - /busca?Ntt=SKU
+    - si PLP: toma primer PDP y la abre
+    Devuelve (pdp_url, html, crumbs_crudos, fuente, modo)
     """
+    sess = new_session(cookies)
     search_url = DOMAIN.rstrip("/") + SEARCH_PATH.format(q=sku)
 
-    # 1) Intento con requests
-    r = session_get(search_url, session=session)
+    r = session_get(search_url, session=sess)
     if r and r.status_code == 200 and r.text:
-        # ¿Redirigió directo a PDP?
+        # ¿redirigió a PDP?
         if ("-p" in r.url) or ("/p/" in r.url):
             crumbs, source = extract_any_taxonomy(r.text)
             if crumbs:
-                return r.url, r.text, crumbs, source, "requests"
-        # Si no, parsear PLP y tomar primer PDP
+                return r.url, r.text, crumbs, source, "requests+cookies"
+        # seguir en PLP -> capturar primer PDP
         pdp_url = resolve_first_pdp_url_from_search_html(r.text)
         if pdp_url:
-            r2 = session_get(pdp_url, session=session)
+            r2 = session_get(pdp_url, session=sess)
             if r2 and r2.status_code == 200 and r2.text:
                 crumbs, source = extract_any_taxonomy(r2.text)
                 if crumbs:
-                    return pdp_url, r2.text, crumbs, source, "requests"
-
-    # 2) Fallback con Playwright
-    if use_playwright and pw_available():
-        pdp_url, pdp_html = get_pdp_html_via_playwright_from_search(search_url)
-        if pdp_url and pdp_html:
-            crumbs, source = extract_any_taxonomy(pdp_html)
-            if crumbs:
-                return pdp_url, pdp_html, crumbs, source, "playwright"
-        html_play = get_html_with_playwright(search_url)
-        if html_play:
-            crumbs, source = extract_any_taxonomy(html_play)
-            if crumbs:
-                return search_url, html_play, crumbs, source, "playwright"
+                    return pdp_url, r2.text, crumbs, source, "requests+cookies"
 
     return None, None, [], "none", "none"
 
-def analyze_sku(sku: str, use_playwright: bool, reveal_html_preview: bool=False) -> Dict[str, str]:
-    sess = requests.Session()
-    sess.headers.update(HEADERS)
-
+def analyze_sku(sku: str, cookies: Dict[str, str]) -> Dict[str, str]:
+    # Probar variantes de SKU (con y sin sufijo)
     for cand in candidate_skus(sku):
-        url, html, crumbs_raw, source, mode = best_effort_pdp_for_sku(cand, use_playwright, sess)
+        url, html, crumbs_raw, source, mode = best_effort_pdp_for_sku_with_cookies(cand, cookies)
         if html:
             crumbs_limpios, solo_home = normalize_crumbs(crumbs_raw)
             if is_catalogado_from_limpios(crumbs_limpios):
-                catalogado = "Sí"
-                obs = ""
+                catalogado, obs = "Sí", ""
             else:
                 if solo_home:
                     obs = "Breadcrumb indica solo Home/Inicio → NO catalogado"
@@ -374,7 +358,7 @@ def analyze_sku(sku: str, use_playwright: bool, reveal_html_preview: bool=False)
                     obs = "Faltan niveles o hay misc."
                 catalogado = "No"
 
-            row = {
+            return {
                 "SKU": sku,
                 "Catalogado": catalogado,
                 "Breadcrumb_crudo": " > ".join(crumbs_raw),
@@ -385,9 +369,6 @@ def analyze_sku(sku: str, use_playwright: bool, reveal_html_preview: bool=False)
                 "Modo": mode,
                 "HTML_len": str(len(html))
             }
-            if reveal_html_preview:
-                row["HTML_preview"] = (html[:1000] + "…") if len(html) > 1000 else html
-            return row
 
     return {
         "SKU": sku,
@@ -398,43 +379,67 @@ def analyze_sku(sku: str, use_playwright: bool, reveal_html_preview: bool=False)
         "URL": "",
         "Observación": "No encontrado / sin HTML",
         "Modo": "none",
-        "HTML_len": "0",
-        "HTML_preview": "" if not reveal_html_preview else ""
+        "HTML_len": "0"
     }
 
 def to_csv(rows: List[Dict[str, str]]) -> bytes:
     buf = io.StringIO()
-    cols = ["SKU", "Catalogado", "Breadcrumb_crudo", "Breadcrumb_limpio", "FuenteTaxonomía", "URL", "Observación", "Modo", "HTML_len"]
+    cols = ["SKU", "Catalogado", "Breadcrumb_crudo", "Breadcrumb_limpio",
+            "FuenteTaxonomía", "URL", "Observación", "Modo", "HTML_len"]
     writer = csv.DictWriter(buf, fieldnames=cols)
     writer.writeheader()
     for r in rows:
         writer.writerow({k: r.get(k, "") for k in cols})
     return buf.getvalue().encode("utf-8")
 
-# ===== UI =====
+# ======= UI =======
 st.set_page_config(page_title="Validador Catalogación simple.ripley.cl", layout="wide")
-st.title("Validador de Catalogación (simple.ripley.cl)")
-st.caption("Buscamos PDP, extraemos breadcrumb/categoría (JSON-LD, microdatos, dataLayer o DOM). Regla: ≥2 niveles útiles y sin 'Otros/Miscel*' = Catalogado. Si el breadcrumb es solo Home/Inicio → NO catalogado.")
+st.title("Validador de Catalogación (simple.ripley.cl) — Sesión con Cookies")
+st.caption("Usa tus cookies de navegador para evitar bloqueos. NO subas cookies al repo. \
+Regla: ≥2 niveles útiles y sin 'Otros/Miscel*' = Catalogado. 'Home' solo → NO catalogado.")
+
+load_dotenv_if_available()  # opcional
+
+with st.expander("🔐 Cargar cookies (elige un método)"):
+    st.markdown("- **.env / variables de entorno**: `COOKIE_HEADER` o `COOKIES_JSON`.")
+    st.markdown("- **Pegado manual**: pega el header completo `cookie: ...` (solo durante la sesión).")
+    cookie_header_ui = st.text_area("Pega tu 'cookie:' header (opcional, se parsea en dict). No se guarda.", height=100)
+
+# 1) cookies desde env
+cookies_env = get_cookies_from_env()
+# 2) cookies desde UI (si el usuario pega un header)
+if cookie_header_ui.strip():
+    try:
+        cookies_from_ui = parse_cookie_header(cookie_header_ui.strip())
+        cookies_env.update(cookies_from_ui)
+    except Exception:
+        st.warning("No se pudo parsear el cookie header pegado.")
+
+cookie_status = "✅ cargadas" if cookies_env else "⚠️ no cargadas"
+st.info(f"Estado cookies: {cookie_status}. (Consejo: usa .env o pega el header arriba)")
 
 colA, colB = st.columns([3,2], gap="large")
 with colA:
-    raw = st.text_area("Pega SKUs (uno por línea)", height=220, placeholder="MPM10002913810-4\nMPM10002913810\n7808774708749")
+    raw = st.text_area("Pega SKUs (uno por línea)", height=220,
+                       placeholder="MPM10002913810-4\nMPM10002913810\n7808774708749")
     run = st.button("Validar catalogación", type="primary")
 with colB:
-    st.markdown("**Parámetros**")
-    use_playwright = st.toggle("Usar Playwright si hace falta (render JS)", value=True)
-    delay = st.slider("Retardo entre SKUs (seg.)", 0.0, 2.0, 0.5, 0.1, help="Evita bloqueos del sitio.")
-    reveal = st.toggle("Mostrar vista previa HTML (diagnóstico)", value=False, help="Incluye las primeras ~1000 letras del HTML para depurar.")
+    delay = st.slider("Retardo entre SKUs (seg.)", 0.0, 2.0, 0.5, 0.1,
+                      help="Evita bloqueos. Recomendado 0.5–1.0s.")
+    only_no = st.toggle("Mostrar sólo NO catalogados", value=False)
 
 if run and raw.strip():
+    if not cookies_env:
+        st.warning("No hay cookies cargadas. Es probable que el sitio bloquee el scraping. "
+                   "Carga COOKIE_HEADER/COOKIES_JSON o pega el header en el expander de arriba.")
     skus = [s.strip() for s in raw.splitlines() if s.strip()]
-    results = []
+    results: List[Dict[str, str]] = []
     progress = st.progress(0)
     status = st.empty()
 
     for i, sku in enumerate(skus, start=1):
         status.info(f"Procesando {i}/{len(skus)}: {sku}")
-        res = analyze_sku(sku, use_playwright, reveal_html_preview=reveal)
+        res = analyze_sku(sku, cookies_env)
         results.append(res)
         progress.progress(i/len(skus))
         if delay:
@@ -442,8 +447,9 @@ if run and raw.strip():
 
     status.success("Listo ✅")
 
+    rows = results if not only_no else [r for r in results if r["Catalogado"] != "Sí"]
     st.subheader("Resultados")
-    st.dataframe(results, use_container_width=True)
+    st.dataframe(rows, use_container_width=True)
 
     total = len(results)
     si = sum(1 for r in results if r["Catalogado"] == "Sí")
@@ -453,9 +459,11 @@ if run and raw.strip():
     c2.metric("Catalogados", si)
     c3.metric("No catalogados", no)
 
-    st.download_button("Descargar CSV (todos)", data=to_csv(results), file_name="catalogacion_simple_ripley.csv", mime="text/csv")
+    st.download_button("Descargar CSV (todos)", data=to_csv(results),
+                       file_name="catalogacion_simple_ripley.csv", mime="text/csv")
 
     with st.expander("Diagnóstico (avanzado)"):
-        st.write("Revisa Modo, FuenteTaxonomía y HTML_len. Si 'requests' + HTML_len bajo → probablemente contenido via JS (usa Playwright). Si FuenteTaxonomía='none' en PDP, el sitio puede estar ocultando datos (sube delay o usa Playwright).")
-        diag_cols = ["SKU","Modo","FuenteTaxonomía","HTML_len","URL","Observación"] + (["HTML_preview"] if reveal else [])
+        st.write("Revisa Modo, FuenteTaxonomía y HTML_len. Si HTML_len≈0 → bloqueo. "
+                 "Actualiza tus cookies (cf_clearance/JSESSIONID) o aumenta el delay.")
+        diag_cols = ["SKU","Modo","FuenteTaxonomía","HTML_len","URL","Observación"]
         st.dataframe([{k: r.get(k, "") for k in diag_cols} for r in results], use_container_width=True)
