@@ -66,32 +66,31 @@ def session_get(url: str, params=None, session: Optional[requests.Session] = Non
     except requests.RequestException:
         return None
     return None
-
-
 def extract_breadcrumb_from_html(html: str) -> list[str]:
-    """
-    Extrae migas de pan desde el DOM (li/a/span), JSON-LD y __NEXT_DATA__.
-    Limpia 'Inicio/Home' y separadores.
-    """
     from bs4 import BeautifulSoup
-    import json, re
+    import re, json
 
     soup = BeautifulSoup(html, "html.parser")
+    
+    # Busca cualquier nav/div/ol/ul con la clase 'breadcrumbs' o 'breadcrumb'
+    root = soup.select_one(
+        'nav.breadcrumbs, nav.breadcrumb, div.breadcrumbs, div.breadcrumb, ol.breadcrumbs, ol.breadcrumb, ul.breadcrumbs, ul.breadcrumb'
+    )
+    if root:
+        # Extrae textos de li, a, span dentro del root
+        els = root.select("li, a, span")
+        crumbs = [e.get_text(" ", strip=True) for e in els if e.get_text(" ", strip=True).strip()]
+        # Limpia separadores y palabras vacías
+        crumbs = [c for c in crumbs if c not in {">", "/", "|", "›", "»", "•"} and c.lower() not in {"home", "inicio"}]
+        # Dedupe consecutivos
+        result = []
+        for c in crumbs:
+            if not result or result[-1] != c:
+                result.append(c)
+        return result
+    return []
 
-    def norm_text(x: str) -> str:
-        return re.sub(r"\s+", " ", (x or "").strip())
 
-    def clean(items: list[str]) -> list[str]:
-        # quita separadores y 'inicio'
-        bad_tokens = {">", "/", "|", "›", "»", "•"}
-        bad_words = {"home", "inicio"}
-        out = []
-        for t in (norm_text(i) for i in items):
-            if not t or t in bad_tokens or t.lower() in bad_words:
-                continue
-            if not out or out[-1] != t:  # dedupe consecutivo
-                out.append(t)
-        return out
 
     # ----- 1) DOM: soporta li/a/span -----
     root = soup.select_one(
