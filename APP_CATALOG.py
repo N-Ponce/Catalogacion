@@ -9,7 +9,7 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 
-# ===== Config =====
+# ===== Configuración solo para simple.ripley.cl =====
 DOMAIN = "https://simple.ripley.cl"
 SEARCH_PATH = "/busca?Ntt={q}"
 TIMEOUT = 20
@@ -71,10 +71,13 @@ def get_html_with_playwright(url: str, wait_selector: Optional[str] = None) -> O
 
 def extract_breadcrumb_from_html(html: str) -> List[str]:
     """
-    Extrae los niveles del breadcrumb para simple.ripley.cl
+    Extrae los niveles del breadcrumb para simple.ripley.cl.
     Busca el <li class="breadcrumbs"> y luego los <a class="breadcrumb"> con <span>.
+    Si no se encuentra, busca variantes y finalmente intenta heurística por texto.
     """
     soup = BeautifulSoup(html, "html.parser")
+
+    # 1. Busca <li class="breadcrumbs">
     root = soup.find("li", class_="breadcrumbs")
     if root:
         crumbs = []
@@ -84,12 +87,39 @@ def extract_breadcrumb_from_html(html: str) -> List[str]:
                 text = span.get_text(strip=True)
                 if text:
                     crumbs.append(text)
-        return crumbs
+        if crumbs:
+            return crumbs
+
+    # 2. Busca cualquier <nav>, <div>, <ol>, <ul> con breadcrumbs/breadcrumb
+    root2 = soup.select_one(
+        'nav.breadcrumbs, nav.breadcrumb, div.breadcrumbs, div.breadcrumb, ol.breadcrumbs, ol.breadcrumb, ul.breadcrumbs, ul.breadcrumb'
+    )
+    if root2:
+        crumbs = []
+        for tag in root2.find_all(['a', 'span', 'li']):
+            txt = tag.get_text(" ", strip=True)
+            txt = txt.strip()
+            if txt and txt not in {">", "/", "|", "›", "»", "•"} and txt.lower() not in {"home", "inicio"}:
+                crumbs.append(txt)
+        # Elimina duplicados consecutivos
+        result = []
+        for c in crumbs:
+            if not result or result[-1] != c:
+                result.append(c)
+        if result:
+            return result
+
+    # 3. Busca el texto de las categorías directamente (heurística visual)
+    posibles = ["Ferretería", "Seguridad Personal", "Ropa de Trabajo"]
+    presentes = [c for c in posibles if c in html]
+    if len(presentes) >= 2:
+        return presentes
+
     return []
 
 def best_effort_pdp_for_sku(sku: str, use_playwright: bool, session: requests.Session) -> tuple:
     """
-    Busca el SKU en simple.ripley.cl y retorna el breadcrumb desde la PDP
+    Busca el SKU en simple.ripley.cl y retorna el breadcrumb desde la PDP.
     """
     search_url = DOMAIN.rstrip("/") + SEARCH_PATH.format(q=sku)
     r = session_get(search_url, session=session)
@@ -112,6 +142,8 @@ def analyze_sku(sku: str, use_playwright: bool) -> Dict[str, str]:
 
     for cand in candidate_skus(sku):
         url, html, crumbs, mode = best_effort_pdp_for_sku(cand, use_playwright, sess)
+        # Diagnóstico: imprime los primeros 500 caracteres del HTML recibido
+        # st.write(f"HTML recibido para {sku}: {html[:500] if html else '[VACÍO]'}")
         if html:
             catalogado = "No"
             obs = ""
@@ -204,5 +236,5 @@ if run and raw.strip():
         st.info("🎉 No se encontraron SKUs no catalogados.")
 
     with st.expander("Diagnóstico (avanzado)"):
-        st.write("Si algo marcó 'No' por error, revisa 'Modo' y 'HTML_len': si 'requests' y HTML_len muy bajo → probablemente requería JS, usa Playwright.")
+        st.write("Si algo marcó 'No' por error, revisa 'Modo' y 'HTML_len': si 'requests' y HTML_len muy bajo → probablemente requería JS, usa Playwright. Si sigue fallando, inspecciona el HTML recibido y ajusta el extractor.")
         st.dataframe([{k: r.get(k, "") for k in ("SKU", "Modo", "HTML_len", "URL")} for r in results], use_container_width=True)
