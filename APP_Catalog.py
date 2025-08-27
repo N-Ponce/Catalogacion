@@ -68,50 +68,42 @@ def session_get(url: str, params=None, session: Optional[requests.Session] = Non
     return None
 
 
-def extract_breadcrumb_from_html(html: str) -> List[str]:
-    """Extrae migas de pan desde DOM, JSON-LD y __NEXT_DATA__ y limpia 'Inicio' y duplicados.
-    Devuelve solo niveles de categoría (sin 'Inicio' ni separadores).
+def extract_breadcrumb_from_html(html: str) -> list[str]:
     """
+    Extrae migas de pan desde el DOM (li/a/span), JSON-LD y __NEXT_DATA__.
+    Limpia 'Inicio/Home' y separadores.
+    """
+    from bs4 import BeautifulSoup
+    import json, re
+
     soup = BeautifulSoup(html, "html.parser")
 
-    def clean_crumbs(raw_crumbs: List[str]) -> List[str]:
-        bad = {"/", ">", "home", "inicio"}
-        out: List[str] = []
-        for c in raw_crumbs:
-            t = re.sub("[\\s]+", " ", c or "").strip()
-            if not t:
-                continue
-            if t.lower() in bad:
-                continue
-            out.append(t)
-        seen = set()
-        uniq: List[str] = []
-        for t in out:
-            if t not in seen:
-                seen.add(t)
-                uniq.append(t)
-        return uniq
+    def norm_text(x: str) -> str:
+        return re.sub(r"\s+", " ", (x or "").strip())
 
-    # 1) DOM típico
-    selectors = [
-        '[aria-label="breadcrumb"] li',
-        'nav[aria-label="breadcrumb"] li',
-        '[data-testid="breadcrumb"] li',
-        '[data-testid="breadcrumb-item"]',
-        '.breadcrumb li',
-        '.breadcrumbs li',
-        'ol[aria-label="Breadcrumb"] li',
-        'nav.breadcrumb li',
-        'ol[role="navigation" i] li',
-    ]
-    for sel in selectors:
-        els = soup.select(sel)
-        crumbs = [e.get_text(strip=True) for e in els if e.get_text(strip=True)]
-        crumbs = clean_crumbs(crumbs)
+    def clean(items: list[str]) -> list[str]:
+        # quita separadores y 'inicio'
+        bad_tokens = {">", "/", "|", "›", "»", "•"}
+        bad_words = {"home", "inicio"}
+        out = []
+        for t in (norm_text(i) for i in items):
+            if not t or t in bad_tokens or t.lower() in bad_words:
+                continue
+            if not out or out[-1] != t:  # dedupe consecutivo
+                out.append(t)
+        return out
+
+    # ----- 1) DOM: soporta li/a/span -----
+    root = soup.select_one(
+        'nav[aria-label="breadcrumb"], nav.breadcrumb, ol.breadcrumb, ul.breadcrumb, div.breadcrumb'
+    )
+    if root:
+        els = root.select("li, a, span, [itemprop='name']")
+        crumbs = clean([e.get_text(" ", strip=True) for e in els])
         if crumbs:
             return crumbs
 
-    # 2) JSON-LD BreadcrumbList y Product.category
+    # ----- 2) JSON-LD -----
     for script in soup.find_all("script", {"type": "application/ld+json"}):
         raw = script.string or ""
         if not raw.strip():
@@ -122,6 +114,7 @@ def extract_breadcrumb_from_html(html: str) -> List[str]:
             continue
         blocks = data if isinstance(data, list) else [data]
         for blk in blocks:
+            # BreadcrumbList
             if isinstance(blk, dict) and blk.get("@type") in ("BreadcrumbList", "ItemList"):
                 items = blk.get("itemListElement") or []
                 names = []
@@ -131,44 +124,44 @@ def extract_breadcrumb_from_html(html: str) -> List[str]:
                         if not name and isinstance(it.get("item"), dict):
                             name = it["item"].get("name")
                         if name:
-                            names.append(str(name).strip())
-                names = clean_crumbs(names)
+                            names.append(str(name))
+                names = clean(names)
                 if names:
                     return names
+            # Product.category como fallback
             if isinstance(blk, dict) and blk.get("@type") == "Product":
                 cat = blk.get("category")
                 if isinstance(cat, str) and cat.strip():
-                    parts = re.split("\\s*>\\s*|/|\\\\|,", cat)
-                    parts = clean_crumbs(parts)
+                    parts = re.split(r"\s*>\s*|/|\\|›|»|,", cat)
+                    parts = clean(parts)
                     if parts:
                         return parts
 
-    # 3) Next.js __NEXT_DATA__ (breadcrumbs en estado)
-    next_data = soup.find("script", id="__NEXT_DATA__")
-    if next_data and next_data.string:
+    # ----- 3) __NEXT_DATA__ (estado de Next.js) -----
+    nd = soup.find("script", id="__NEXT_DATA__")
+    if nd and nd.string:
         try:
-            j = json.loads(next_data.string)
-            def walk(x, acc: List[str]):
+            j = json.loads(nd.string)
+            acc = []
+            def walk(x):
                 if isinstance(x, dict):
                     for k, v in x.items():
                         if isinstance(v, list) and k.lower() in ("breadcrumb", "breadcrumbs"):
-                            for item in v:
-                                if isinstance(item, dict):
-                                    n = item.get("name") or item.get("label") or item.get("title")
-                                    if n:
-                                        acc.append(str(n))
-                                elif isinstance(item, str):
-                                    acc.append(item)
-                        elif isinstance(v, dict) or isinstance(v, list):
-                            walk(v, acc)
+                            for it in v:
+                                if isinstance(it, dict):
+                                    n = it.get("name") or it.get("label") or it.get("title")
+                                    if n: acc.append(str(n))
+                                elif isinstance(it, str):
+                                    acc.append(it)
+                        else:
+                            walk(v)
                 elif isinstance(x, list):
-                    for v in x:
-                        walk(v, acc)
-            names: List[str] = []
-            walk(j, names)
-            names = clean_crumbs(names)
-            if names:
-                return names
+                    for i in x:
+                        walk(i)
+            walk(j)
+            acc = clean(acc)
+            if acc:
+                return acc
         except Exception:
             pass
 
