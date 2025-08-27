@@ -160,7 +160,7 @@ def extract_breadcrumb_from_html(html: str) -> List[str]:
                                     if n:
                                         acc.append(str(n))
                                 elif isinstance(item, str):p_headers=HEADERS,
-            )
+            
             page = context.new_page()
             page.goto(url, wait_until="networkidle", timeout=35000)
             # Espera heurística de breadcrumb o título
