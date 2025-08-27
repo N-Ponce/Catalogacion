@@ -1,3 +1,4 @@
+# APP_CATALOG.py
 # -*- coding: utf-8 -*-
 """
 Validador de Catalogación (simple.ripley.cl) — Vía API pública VTEX (sin cookies)
@@ -61,6 +62,11 @@ def new_session() -> requests.Session:
     """Return a preconfigured session able to bypass Cloudflare."""
     s = cloudscraper.create_scraper()
     s.headers.update(HEADERS)
+    # warm session with homepage to obtain necessary cookies
+    try:
+        s.get(DOMAIN, timeout=TIMEOUT)
+    except requests.RequestException:
+        pass
     return s
 
 def session_get_json(url: str, session: requests.Session) -> Optional[object]:
@@ -73,10 +79,18 @@ def session_get_json(url: str, session: requests.Session) -> Optional[object]:
 
     body_lower = r.text.lower() if r.text else ""
     if r.status_code == 403 or "cloudflare" in body_lower:
-        st.error(
-            f"Cloudflare bloqueó la solicitud ({r.status_code}) para {url}. Revisa IP o cookies."
-        )
-        return None
+        # try refreshing cookies once by hitting the homepage and retry
+        try:
+            session.get(DOMAIN, timeout=TIMEOUT)
+            r = session.get(url, timeout=TIMEOUT)
+            body_lower = r.text.lower() if r.text else ""
+        except requests.RequestException:
+            pass
+        if r.status_code == 403 or "cloudflare" in body_lower:
+            st.error(
+                f"Cloudflare bloqueó la solicitud ({r.status_code}) para {url}. Revisa IP o cookies."
+            )
+            return None
     if r.status_code != 200:
         st.warning(f"Solicitud falló ({r.status_code}) para {url}")
         return None
@@ -189,7 +203,7 @@ def vtex_lookup_for_sku(sku: str, session: requests.Session) -> Tuple[Optional[s
     endpoints = [
         f"/api/catalog_system/pub/products/search/?fq=alternateIds_RefId:{sku}",
         f"/api/catalog_system/pub/products/search/?fq=skuId:{sku}",
-        f"/api/catalog_system/pub/products/search/?ft={sku}",
+        f"/api/catalog_system/pub/products/search/?ft:{sku}",
     ]
     for ep in endpoints:
         url = urljoin(DOMAIN, ep)
