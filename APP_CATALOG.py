@@ -23,6 +23,7 @@ Diagnóstico:
 import re
 import io
 import csv
+import cloudscraper
 import time
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urljoin
