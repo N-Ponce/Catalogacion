@@ -23,13 +23,13 @@ Diagnóstico:
 import re
 import io
 import csv
-import cloudscraper
 import time
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urljoin
 from json import JSONDecodeError
 
 import requests
+import cloudscraper  # type: ignore
 import streamlit as st
 
 # ---------- Config ----------
@@ -58,29 +58,36 @@ def candidate_skus(s: str) -> List[str]:
     return cands
 
 def new_session() -> requests.Session:
+    """Return a preconfigured session able to bypass Cloudflare."""
     s = cloudscraper.create_scraper()
     s.headers.update(HEADERS)
     return s
 
 def session_get_json(url: str, session: requests.Session) -> Optional[object]:
+    """GET a URL and return JSON, surfacing Cloudflare blocks clearly."""
     try:
         r = session.get(url, timeout=TIMEOUT)
-        if r.status_code == 403:
-            st.error(
-                f"Cloudflare bloqueó la solicitud ({r.status_code}) para {url}. "
-                "Revisa IP o cookies."
-            )
-        elif r.status_code == 200 and r.text:
-            # En VTEX, siempre es JSON (lista o dict); si no, puede venir HTML de error
-            try:
-                return r.json()
-            except JSONDecodeError as e:
-                st.warning(f"Error al decodificar JSON ({r.status_code}) {url}: {e}")
-        else:
-            st.warning(f"Solicitud falló ({r.status_code}) para {url}")
     except requests.RequestException as e:
         st.warning(f"Error de red al solicitar {url}: {e}")
-    return None
+        return None
+
+    body_lower = r.text.lower() if r.text else ""
+    if r.status_code == 403 or "cloudflare" in body_lower:
+        st.error(
+            f"Cloudflare bloqueó la solicitud ({r.status_code}) para {url}. Revisa IP o cookies."
+        )
+        return None
+    if r.status_code != 200:
+        st.warning(f"Solicitud falló ({r.status_code}) para {url}")
+        return None
+    if not r.headers.get("Content-Type", "").startswith("application/json"):
+        st.warning(f"Contenido no JSON devuelto ({r.status_code}) para {url}")
+        return None
+    try:
+        return r.json()
+    except JSONDecodeError as e:
+        st.warning(f"Error al decodificar JSON ({r.status_code}) {url}: {e}")
+        return None
 
 def normalize_crumbs(raw_crumbs: List[str]) -> Tuple[List[str], bool]:
     cleaned, had_any = [], False
