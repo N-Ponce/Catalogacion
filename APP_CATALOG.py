@@ -1,24 +1,16 @@
-# app.py — Validador de catalogación por breadcrumb (Ripley)
-# v2: Fallback a Playwright para páginas renderizadas con JS + mejores selectores y headers
-
 import re
 import time
-import json
 import csv
 import io
 import random
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Dict, Optional
 
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 
 # ===== Config =====
-DOMAINS = [
-    "https://www.ripley.com",      # global
-    "https://simple.ripley.cl",    # Chile
-    "https://www.ripley.com.pe",   # Perú
-]
+DOMAIN = "https://simple.ripley.cl"
 SEARCH_PATH = "/busca?Ntt={q}"
 TIMEOUT = 20
 HEADERS = {
@@ -32,20 +24,8 @@ HEADERS = {
 }
 MISC_PAT = re.compile(r"(otros|miscel|varios|variedad|otros productos)", re.IGNORECASE)
 
-# ===== Utilities =====
-@st.cache_data(show_spinner=False)
-def _install_playwright_once() -> None:
-    """Instala Chromium para Playwright solo la primera vez (si está disponible)."""
-    try:
-        import subprocess, sys
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
-    except Exception:
-        pass
-
-
-def sleep_jitter(base: float = 0.4, spread: float = 0.8) -> None:
+def sleep_jitter(base: float = 0.3, spread: float = 0.6) -> None:
     time.sleep(base + random.random() * spread)
-
 
 def candidate_skus(s: str) -> List[str]:
     s = s.strip()
@@ -56,122 +36,28 @@ def candidate_skus(s: str) -> List[str]:
             cands.append(base)
     return cands
 
-
-def session_get(url: str, params=None, session: Optional[requests.Session] = None) -> Optional[requests.Response]:
+def session_get(url: str, session: Optional[requests.Session] = None) -> Optional[requests.Response]:
     sess = session or requests.Session()
     try:
-        r = sess.get(url, params=params, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
+        r = sess.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
         if r.status_code == 200 and r.text:
             return r
     except requests.RequestException:
         return None
     return None
-    
-def extract_breadcrumb_from_html(html: str) -> list[str]:
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Busca el <li class="breadcrumbs">
-    root = soup.find("li", class_="breadcrumbs")
-    if root:
-        # Busca todos los <a> dentro de ese li
-        crumbs = []
-        for a in root.find_all("a", class_="breadcrumb"):
-            span = a.find("span")
-            if span and span.get_text(strip=True):
-                crumbs.append(span.get_text(strip=True))
-        return crumbs
-    return []
-
-    # ----- 1) DOM: soporta li/a/span -----
-    root = soup.select_one(
-        'nav[aria-label="breadcrumb"], nav.breadcrumb, ol.breadcrumb, ul.breadcrumb, div.breadcrumb'
-    )
-    if root:
-        els = root.select("li, a, span, [itemprop='name']")
-        crumbs = clean([e.get_text(" ", strip=True) for e in els])
-        if crumbs:
-            return crumbs
-
-    # ----- 2) JSON-LD -----
-    for script in soup.find_all("script", {"type": "application/ld+json"}):
-        raw = script.string or ""
-        if not raw.strip():
-            continue
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-        blocks = data if isinstance(data, list) else [data]
-        for blk in blocks:
-            # BreadcrumbList
-            if isinstance(blk, dict) and blk.get("@type") in ("BreadcrumbList", "ItemList"):
-                items = blk.get("itemListElement") or []
-                names = []
-                for it in items:
-                    if isinstance(it, dict):
-                        name = it.get("name")
-                        if not name and isinstance(it.get("item"), dict):
-                            name = it["item"].get("name")
-                        if name:
-                            names.append(str(name))
-                names = clean(names)
-                if names:
-                    return names
-            # Product.category como fallback
-            if isinstance(blk, dict) and blk.get("@type") == "Product":
-                cat = blk.get("category")
-                if isinstance(cat, str) and cat.strip():
-                    parts = re.split(r"\s*>\s*|/|\\|›|»|,", cat)
-                    parts = clean(parts)
-                    if parts:
-                        return parts
-
-    # ----- 3) __NEXT_DATA__ (estado de Next.js) -----
-    nd = soup.find("script", id="__NEXT_DATA__")
-    if nd and nd.string:
-        try:
-            j = json.loads(nd.string)
-            acc = []
-            def walk(x):
-                if isinstance(x, dict):
-                    for k, v in x.items():
-                        if isinstance(v, list) and k.lower() in ("breadcrumb", "breadcrumbs"):
-                            for it in v:
-                                if isinstance(it, dict):
-                                    n = it.get("name") or it.get("label") or it.get("title")
-                                    if n: acc.append(str(n))
-                                elif isinstance(it, str):
-                                    acc.append(it)
-                        else:
-                            walk(v)
-                elif isinstance(x, list):
-                    for i in x:
-                        walk(i)
-            walk(j)
-            acc = clean(acc)
-            if acc:
-                return acc
-        except Exception:
-            pass
-
-    return []
 
 def get_html_with_playwright(url: str, wait_selector: Optional[str] = None) -> Optional[str]:
-    """Intenta obtener el HTML usando Playwright (solo si está instalado)."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return None
     try:
-        _install_playwright_once()
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             context = browser.new_context(user_agent=HEADERS["User-Agent"])
             page = context.new_page()
             page.goto(url, wait_until="networkidle", timeout=35000)
-            sel = wait_selector or "nav[aria-label='breadcrumb'], [aria-label='breadcrumb'], .breadcrumb, .breadcrumbs, h1"
+            sel = wait_selector or "li.breadcrumbs"
             try:
                 page.wait_for_selector(sel, timeout=8000)
             except Exception:
@@ -183,68 +69,50 @@ def get_html_with_playwright(url: str, wait_selector: Optional[str] = None) -> O
     except Exception:
         return None
 
-def best_effort_pdp_via_requests(sku: str, base_url: str, session: requests.Session) -> Tuple[Optional[str], Optional[str]]:
-    """Intenta obtener el PDP usando requests."""
-    pdp_url = base_url.rstrip("/") + "/p/" + sku
-    r = session_get(pdp_url, session=session)
+def extract_breadcrumb_from_html(html: str) -> List[str]:
+    """
+    Extrae los niveles del breadcrumb para simple.ripley.cl
+    Busca el <li class="breadcrumbs"> y luego los <a class="breadcrumb"> con <span>.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    root = soup.find("li", class_="breadcrumbs")
+    if root:
+        crumbs = []
+        for a in root.find_all("a", class_="breadcrumb"):
+            span = a.find("span")
+            if span:
+                text = span.get_text(strip=True)
+                if text:
+                    crumbs.append(text)
+        return crumbs
+    return []
+
+def best_effort_pdp_for_sku(sku: str, use_playwright: bool, session: requests.Session) -> tuple:
+    """
+    Busca el SKU en simple.ripley.cl y retorna el breadcrumb desde la PDP
+    """
+    search_url = DOMAIN.rstrip("/") + SEARCH_PATH.format(q=sku)
+    r = session_get(search_url, session=session)
     if r and r.status_code == 200:
-        return pdp_url, r.text
-    return None, None
-
-# ======= FUNCION MODIFICADA =======
-def best_effort_pdp_for_sku(sku: str, base_url: str, use_playwright: bool, session: requests.Session) -> Tuple[Optional[str], Optional[str], str]:
-    """
-    Obtiene la página de producto para el SKU, adaptado para simple.ripley.cl donde la búsqueda redirige directo al PDP.
-    """
-    # Si estamos en simple.ripley.cl, buscar y analizar directamente
-    if "simple.ripley.cl" in base_url:
-        search_url = base_url.rstrip("/") + SEARCH_PATH.format(q=sku)
-        r = session_get(search_url, session=session)
-        if r and r.status_code == 200:
-            html = r.text
-            crumbs = extract_breadcrumb_from_html(html)
-            if crumbs:
-                return r.url, html, "requests"
-            # Si la página requiere JS, usa Playwright
-            if use_playwright:
-                html_play = get_html_with_playwright(search_url)
-                if html_play:
-                    crumbs_play = extract_breadcrumb_from_html(html_play)
-                    if crumbs_play:
-                        return search_url, html_play, "playwright"
-        return None, None, "none"
-    else:
-        # Lógica original para otros dominios (busca PDP por enlaces en resultados)
-        url, html = best_effort_pdp_via_requests(sku, base_url, session)
-        if html:
-            return url, html, "requests"
+        html = r.text
+        crumbs = extract_breadcrumb_from_html(html)
+        if crumbs:
+            return r.url, html, crumbs, "requests"
         if use_playwright:
-            search_url = base_url.rstrip("/") + SEARCH_PATH.format(q=sku)
-            html_search = get_html_with_playwright(search_url)
-            if html_search:
-                crumbs = extract_breadcrumb_from_html(html_search)
-                if crumbs:
-                    soup = BeautifulSoup(html_search, "html.parser")
-                    links = soup.select("a[href*='/p/']")
-                    for a in links:
-                        href = a.get("href")
-                        # Mejor comparación: busca el SKU dentro del href
-                        if href and "/p/" in href and sku in href:
-                            pdp_url = base_url.rstrip("/") + href
-                            html_pdp = get_html_with_playwright(pdp_url)
-                            if html_pdp:
-                                return pdp_url, html_pdp, "playwright(pdp)"
-        return None, None, "none"
-# ================================
+            html_play = get_html_with_playwright(search_url)
+            if html_play:
+                crumbs_play = extract_breadcrumb_from_html(html_play)
+                if crumbs_play:
+                    return search_url, html_play, crumbs_play, "playwright"
+    return None, None, [], "none"
 
-def analyze_sku(sku: str, base_url: str, use_playwright: bool) -> Dict[str, str]:
+def analyze_sku(sku: str, use_playwright: bool) -> Dict[str, str]:
     sess = requests.Session()
     sess.headers.update(HEADERS)
 
     for cand in candidate_skus(sku):
-        url, html, mode = best_effort_pdp_for_sku(cand, base_url, use_playwright, sess)
+        url, html, crumbs, mode = best_effort_pdp_for_sku(cand, use_playwright, sess)
         if html:
-            crumbs = extract_breadcrumb_from_html(html)
             catalogado = "No"
             obs = ""
             if len(crumbs) >= 2 and not any(MISC_PAT.search(c) for c in crumbs):
@@ -280,14 +148,13 @@ def to_csv(rows: List[Dict[str, str]]) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 # ===== UI =====
-st.set_page_config(page_title="Validador de Catalogación Ripley", layout="wide")
+st.set_page_config(page_title="Validador Catalogación simple.ripley.cl", layout="wide")
 
-st.title("Validador de Catalogación por Breadcrumb (Ripley)")
-st.caption("Pega SKUs, abrimos búsqueda → PDP y leemos breadcrumb. Regla: ≥2 niveles y sin 'Otros/Misceláneos/Var.*' = Catalogado. v2 con Playwright fallback.")
+st.title("Validador de Catalogación por Breadcrumb (simple.ripley.cl)")
+st.caption("Pega SKUs, abrimos búsqueda → PDP y leemos breadcrumb. Regla: ≥2 niveles y sin 'Otros/Misceláneos/Var.*' = Catalogado.")
 
 colA, colB = st.columns([3,2], gap="large")
 with colA:
-    domain = st.selectbox("Dominio de Ripley", DOMAINS, index=0)
     raw = st.text_area("Pega SKUs (uno por línea)", height=220, placeholder="MPM10002913810-4\nMPM10002913810\n7808774708749")
     run = st.button("Validar catalogación", type="primary")
 
@@ -305,7 +172,7 @@ if run and raw.strip():
 
     for i, sku in enumerate(skus, start=1):
         status.info(f"Procesando {i}/{len(skus)}: {sku}")
-        res = analyze_sku(sku, domain, use_playwright)
+        res = analyze_sku(sku, use_playwright)
         results.append(res)
         progress.progress(i/len(skus))
         if delay:
@@ -330,8 +197,8 @@ if run and raw.strip():
 
     no_list = [r["SKU"] for r in results if r["Catalogado"] != "Sí"]
     if no_list:
-        st.download_button("Descargar CSV (todos)", data=to_csv(results), file_name="catalogacion_ripley_v2.csv", mime="text/csv")
-        st.download_button("Descargar SOLO no catalogados (CSV)", data=to_csv([r for r in results if r["Catalogado"] != "Sí"]), file_name="no_catalogados_v2.csv", mime="text/csv")
+        st.download_button("Descargar CSV (todos)", data=to_csv(results), file_name="catalogacion_simple_ripley.csv", mime="text/csv")
+        st.download_button("Descargar SOLO no catalogados (CSV)", data=to_csv([r for r in results if r["Catalogado"] != "Sí"]), file_name="no_catalogados.csv", mime="text/csv")
         st.text_area("SKUs NO catalogados (copiar/pegar)", value="\n".join(no_list), height=120)
     else:
         st.info("🎉 No se encontraron SKUs no catalogados.")
