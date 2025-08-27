@@ -20,14 +20,13 @@ Diagnóstico:
 - JSON_count = cuántos productos devolvió
 """
 
-import os
 import re
 import io
 import csv
-import json
 import time
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urljoin
+from json import JSONDecodeError
 
 import requests
 import streamlit as st
@@ -69,10 +68,12 @@ def session_get_json(url: str, session: requests.Session) -> Optional[object]:
             # En VTEX, siempre es JSON (lista o dict); si no, puede venir HTML de error
             try:
                 return r.json()
-            except Exception:
-                return None
-    except requests.RequestException:
-        return None
+            except JSONDecodeError as e:
+                st.warning(f"Error al decodificar JSON ({r.status_code}) {url}: {e}")
+        else:
+            st.warning(f"Solicitud falló ({r.status_code}) para {url}")
+    except requests.RequestException as e:
+        st.warning(f"Error de red al solicitar {url}: {e}")
     return None
 
 def normalize_crumbs(raw_crumbs: List[str]) -> Tuple[List[str], bool]:
@@ -188,8 +189,7 @@ def vtex_lookup_for_sku(sku: str, session: requests.Session) -> Tuple[Optional[s
     return None, [], "none", 0
 
 # ---------- Main logic ----------
-def analyze_sku(sku: str) -> Dict[str, str]:
-    sess = new_session()
+def analyze_sku(sku: str, sess: requests.Session) -> Dict[str, str]:
     for cand in candidate_skus(sku):
         pdp_url, crumbs_raw, endpoint, n = vtex_lookup_for_sku(cand, sess)
         if crumbs_raw:
@@ -280,13 +280,17 @@ if run and raw.strip():
     progress = st.progress(0)
     status = st.empty()
 
-    for i, sku in enumerate(skus, start=1):
-        status.info(f"Procesando {i}/{len(skus)}: {sku}")
-        res = analyze_sku(sku)
-        results.append(res)
-        progress.progress(i/len(skus))
-        if delay:
-            time.sleep(delay)
+    sess = new_session()
+    try:
+        for i, sku in enumerate(skus, start=1):
+            status.info(f"Procesando {i}/{len(skus)}: {sku}")
+            res = analyze_sku(sku, sess)
+            results.append(res)
+            progress.progress(i/len(skus))
+            if delay:
+                time.sleep(delay)
+    finally:
+        sess.close()
 
     status.success("Listo ✅")
 
