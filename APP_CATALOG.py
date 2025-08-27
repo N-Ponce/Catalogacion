@@ -66,31 +66,23 @@ def session_get(url: str, params=None, session: Optional[requests.Session] = Non
     except requests.RequestException:
         return None
     return None
+    
 def extract_breadcrumb_from_html(html: str) -> list[str]:
     from bs4 import BeautifulSoup
-    import re, json
 
     soup = BeautifulSoup(html, "html.parser")
-    
-    # Busca cualquier nav/div/ol/ul con la clase 'breadcrumbs' o 'breadcrumb'
-    root = soup.select_one(
-        'nav.breadcrumbs, nav.breadcrumb, div.breadcrumbs, div.breadcrumb, ol.breadcrumbs, ol.breadcrumb, ul.breadcrumbs, ul.breadcrumb'
-    )
+
+    # Busca el <li class="breadcrumbs">
+    root = soup.find("li", class_="breadcrumbs")
     if root:
-        # Extrae textos de li, a, span dentro del root
-        els = root.select("li, a, span")
-        crumbs = [e.get_text(" ", strip=True) for e in els if e.get_text(" ", strip=True).strip()]
-        # Limpia separadores y palabras vacías
-        crumbs = [c for c in crumbs if c not in {">", "/", "|", "›", "»", "•"} and c.lower() not in {"home", "inicio"}]
-        # Dedupe consecutivos
-        result = []
-        for c in crumbs:
-            if not result or result[-1] != c:
-                result.append(c)
-        return result
+        # Busca todos los <a> dentro de ese li
+        crumbs = []
+        for a in root.find_all("a", class_="breadcrumb"):
+            span = a.find("span")
+            if span and span.get_text(strip=True):
+                crumbs.append(span.get_text(strip=True))
+        return crumbs
     return []
-
-
 
     # ----- 1) DOM: soporta li/a/span -----
     root = soup.select_one(
