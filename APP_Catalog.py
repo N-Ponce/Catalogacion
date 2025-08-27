@@ -75,7 +75,6 @@ def extract_breadcrumb_from_html(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
 
     def clean_crumbs(raw_crumbs: List[str]) -> List[str]:
-        # Normaliza texto, quita 'Inicio/Home' y separadores
         bad = {"/", ">", "home", "inicio"}
         out: List[str] = []
         for c in raw_crumbs:
@@ -85,7 +84,6 @@ def extract_breadcrumb_from_html(html: str) -> List[str]:
             if t.lower() in bad:
                 continue
             out.append(t)
-        # quita duplicados preservando orden
         seen = set()
         uniq: List[str] = []
         for t in out:
@@ -159,11 +157,36 @@ def extract_breadcrumb_from_html(html: str) -> List[str]:
                                     n = item.get("name") or item.get("label") or item.get("title")
                                     if n:
                                         acc.append(str(n))
-                                elif isinstance(item, str):p_headers=HEADERS,
-            
+                                elif isinstance(item, str):
+                                    acc.append(item)
+                        elif isinstance(v, dict) or isinstance(v, list):
+                            walk(v, acc)
+                elif isinstance(x, list):
+                    for v in x:
+                        walk(v, acc)
+            names: List[str] = []
+            walk(j, names)
+            names = clean_crumbs(names)
+            if names:
+                return names
+        except Exception:
+            pass
+
+    return []
+
+def get_html_with_playwright(url: str, wait_selector: Optional[str] = None) -> Optional[str]:
+    """Intenta obtener el HTML usando Playwright (solo si está instalado)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    try:
+        _install_playwright_once()
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(user_agent=HEADERS["User-Agent"])
             page = context.new_page()
             page.goto(url, wait_until="networkidle", timeout=35000)
-            # Espera heurística de breadcrumb o título
             sel = wait_selector or "nav[aria-label='breadcrumb'], [aria-label='breadcrumb'], .breadcrumb, .breadcrumbs, h1"
             try:
                 page.wait_for_selector(sel, timeout=8000)
@@ -176,6 +199,13 @@ def extract_breadcrumb_from_html(html: str) -> List[str]:
     except Exception:
         return None
 
+def best_effort_pdp_via_requests(sku: str, base_url: str, session: requests.Session) -> Tuple[Optional[str], Optional[str]]:
+    """Intenta obtener el PDP usando requests."""
+    pdp_url = base_url.rstrip("/") + "/p/" + sku
+    r = session_get(pdp_url, session=session)
+    if r and r.status_code == 200:
+        return pdp_url, r.text
+    return None, None
 
 def best_effort_pdp_for_sku(sku: str, base_url: str, use_playwright: bool, session: requests.Session) -> Tuple[Optional[str], Optional[str], str]:
     # 1) requests — rápido
@@ -190,18 +220,54 @@ def best_effort_pdp_for_sku(sku: str, base_url: str, use_playwright: bool, sessi
         if html_search:
             crumbs = extract_breadcrumb_from_html(html_search)
             if crumbs:
-               html_pdp = get_html_with_playwright(pdp_url)
-                if html_pdp:
-                    return pdp_url, html_pdp, "playwright(pdp)"
+                # Intentar obtener la página del producto desde la búsqueda
+                soup = BeautifulSoup(html_search, "html.parser")
+                links = soup.select("a[href*='/p/']")
+                for a in links:
+                    href = a.get("href")
+                    if href and "/p/" in href:
+                        pdp_url = base_url.rstrip("/") + href
+                        html_pdp = get_html_with_playwright(pdp_url)
+                        if html_pdp:
+                            return pdp_url, html_pdp, "playwright(pdp)"
     return None, None, "none"
-
 
 def analyze_sku(sku: str, base_url: str, use_playwright: bool) -> Dict[str, str]:
     sess = requests.Session()
-    # cookies iniciales (mejoran compatibilidad, opcional)
     sess.headers.update(HEADERS)
 
-    for cand in candidateadcrumb", "URL", "Observación", "Modo", "HTML_len"]
+    for cand in candidate_skus(sku):
+        url, html, mode = best_effort_pdp_for_sku(cand, base_url, use_playwright, sess)
+        if html:
+            crumbs = extract_breadcrumb_from_html(html)
+            catalogado = "No"
+            obs = ""
+            if len(crumbs) >= 2 and not any(MISC_PAT.search(c) for c in crumbs):
+                catalogado = "Sí"
+            else:
+                obs = "Faltan niveles o hay misc."
+            return {
+                "SKU": sku,
+                "Catalogado": catalogado,
+                "Breadcrumb": " > ".join(crumbs),
+                "URL": url or "",
+                "Observación": obs,
+                "Modo": mode,
+                "HTML_len": str(len(html) if html else 0)
+            }
+    return {
+        "SKU": sku,
+        "Catalogado": "No",
+        "Breadcrumb": "",
+        "URL": "",
+        "Observación": "No encontrado / sin HTML",
+        "Modo": "none",
+        "HTML_len": "0"
+    }
+
+def to_csv(rows: List[Dict[str, str]]) -> bytes:
+    buf = io.StringIO()
+    cols = ["SKU", "Catalogado", "Breadcrumb", "URL", "Observación", "Modo", "HTML_len"]
     writer = csv.DictWriter(buf, fieldnames=cols)
     writer.writeheader()
     for r in rows:
