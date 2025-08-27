@@ -57,14 +57,19 @@ def candidate_skus(s: str) -> List[str]:
     return cands
 
 def new_session() -> requests.Session:
-    s = requests.Session()
+    s = cloudscraper.create_scraper()
     s.headers.update(HEADERS)
     return s
 
 def session_get_json(url: str, session: requests.Session) -> Optional[object]:
     try:
         r = session.get(url, timeout=TIMEOUT)
-        if r.status_code == 200 and r.text:
+        if r.status_code == 403:
+            st.error(
+                f"Cloudflare bloqueó la solicitud ({r.status_code}) para {url}. "
+                "Revisa IP o cookies."
+            )
+        elif r.status_code == 200 and r.text:
             # En VTEX, siempre es JSON (lista o dict); si no, puede venir HTML de error
             try:
                 return r.json()
