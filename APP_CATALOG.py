@@ -29,6 +29,12 @@ HEADERS = {
 }
 MISC_PAT = re.compile(r"(otros|miscel|varios|variedad|otros productos)", re.IGNORECASE)
 
+# Palabras de ruido que no cuentan como nivel de categoría
+HOME_NOISE = {
+    "home", "inicio", "búsqueda", "busqueda", "resultados", "search", "results"
+}
+
+# ===== Utilidades =====
 def candidate_skus(s: str) -> List[str]:
     s = s.strip()
     cands = [s]
@@ -48,7 +54,6 @@ def session_get(url: str, session: Optional[requests.Session] = None) -> Optiona
         return None
     return None
 
-# ====== Playwright helpers ======
 def pw_available() -> bool:
     try:
         import importlib
@@ -57,6 +62,7 @@ def pw_available() -> bool:
     except Exception:
         return False
 
+# ===== Playwright helpers =====
 def get_html_with_playwright(url: str) -> Optional[str]:
     try:
         from playwright.sync_api import sync_playwright
@@ -89,7 +95,6 @@ def get_pdp_html_via_playwright_from_search(search_url: str) -> Tuple[Optional[s
             sel = 'a[href*="-p"], a[href*="/p/"]'
             el = page.query_selector(sel)
             if not el:
-                html_plp = page.content()
                 context.close()
                 browser.close()
                 return None, None
@@ -107,31 +112,36 @@ def get_pdp_html_via_playwright_from_search(search_url: str) -> Tuple[Optional[s
     except Exception:
         return None, None
 
-# ====== Extractores ======
-def extract_breadcrumb_from_jsonld(html: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
+# ===== Extractores de taxonomía =====
+def _iter_jsonld_blocks(soup: BeautifulSoup):
     for s in soup.find_all("script", type="application/ld+json"):
         txt = s.string or ""
         if not txt.strip():
             continue
-        # A veces vienen múltiples JSON pegados, intenta línea por línea
-        candidates = []
+        # Caso normal
         try:
             data = json.loads(txt)
-            candidates = data if isinstance(data, list) else [data]
+            yield data
+            continue
         except Exception:
-            for line in txt.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    candidates.append(json.loads(line))
-                except Exception:
-                    pass
+            pass
+        # A veces vienen múltiples JSON en líneas
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+def extract_breadcrumb_from_jsonld(html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    for data in _iter_jsonld_blocks(soup):
+        candidates = data if isinstance(data, list) else [data]
         for obj in candidates:
             if not isinstance(obj, dict):
                 continue
-            # BreadcrumbList directo
             if obj.get("@type") == "BreadcrumbList" and isinstance(obj.get("itemListElement"), list):
                 names = []
                 for it in obj["itemListElement"]:
@@ -142,12 +152,11 @@ def extract_breadcrumb_from_jsonld(html: str) -> List[str]:
                         if not name:
                             name = it.get("name")
                     if isinstance(name, str):
-                        name = name.strip()
-                        if name and name.lower() not in {"home", "inicio"}:
-                            names.append(name)
+                        nm = name.strip()
+                        if nm and nm.lower() not in {"home", "inicio"}:
+                            names.append(nm)
                 if names:
                     return names
-            # BreadcrumbList embebido en "@graph"
             if "@graph" in obj and isinstance(obj["@graph"], list):
                 for g in obj["@graph"]:
                     if isinstance(g, dict) and g.get("@type") == "BreadcrumbList":
@@ -155,32 +164,17 @@ def extract_breadcrumb_from_jsonld(html: str) -> List[str]:
                         for it in g.get("itemListElement", []):
                             name = (isinstance(it.get("item"), dict) and it["item"].get("name")) or it.get("name")
                             if isinstance(name, str):
-                                name = name.strip()
-                                if name and name.lower() not in {"home", "inicio"}:
-                                    names.append(name)
+                                nm = name.strip()
+                                if nm and nm.lower() not in {"home", "inicio"}:
+                                    names.append(nm)
                         if names:
                             return names
     return []
 
 def extract_product_category_from_jsonld(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
-    for s in soup.find_all("script", type="application/ld+json"):
-        txt = s.string or ""
-        if not txt.strip():
-            continue
-        candidates = []
-        try:
-            data = json.loads(txt)
-            candidates = data if isinstance(data, list) else [data]
-        except Exception:
-            for line in txt.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    candidates.append(json.loads(line))
-                except Exception:
-                    pass
+    for data in _iter_jsonld_blocks(soup):
+        candidates = data if isinstance(data, list) else [data]
         for obj in candidates:
             if not isinstance(obj, dict):
                 continue
@@ -203,7 +197,7 @@ def extract_breadcrumb_from_microdata(html: str) -> List[str]:
     return [n for n in names if n.lower() not in {"home", "inicio"}]
 
 def extract_category_from_datalayer(html: str) -> Optional[str]:
-    # Busca dataLayer / vtex variables con category/department
+    # dataLayer o estructuras similares
     m = re.search(r"dataLayer\s*=\s*(\[[\s\S]*?\])", html)
     if not m:
         m = re.search(r"vtex[\s\S]{0,50}=\s*(\{[\s\S]*?\});", html)
@@ -211,7 +205,6 @@ def extract_category_from_datalayer(html: str) -> Optional[str]:
         txt = m.group(1)
         try:
             data = json.loads(txt)
-            # Puede ser lista de dicts
             if isinstance(data, list):
                 for ev in data:
                     if isinstance(ev, dict):
@@ -250,14 +243,14 @@ def extract_breadcrumb_from_dom(html: str) -> List[str]:
 
 def extract_any_taxonomy(html: str) -> Tuple[List[str], str]:
     """
-    Devuelve (niveles, fuente) donde fuente ∈ {jsonld_breadcrumb, jsonld_product, microdata, datalayer, dom, none}
+    Devuelve (niveles, fuente) donde fuente ∈
+    {jsonld_breadcrumb, jsonld_product, microdata, datalayer, dom, none}
     """
     crumbs = extract_breadcrumb_from_jsonld(html)
     if crumbs:
         return crumbs, "jsonld_breadcrumb"
     cat = extract_product_category_from_jsonld(html)
     if cat:
-        # separar por separadores comunes
         parts = re.split(r"\s*[>/\|›»]+\s*|\s*>\s*|\s*/\s*|\s*-\s*", cat)
         parts = [p.strip() for p in parts if p.strip()]
         return parts if parts else [cat], "jsonld_product"
@@ -274,7 +267,39 @@ def extract_any_taxonomy(html: str) -> Tuple[List[str], str]:
         return dom, "dom"
     return [], "none"
 
-# ====== PLP -> PDP ======
+# ===== Normalización / regla de catalogación =====
+def normalize_crumbs(raw_crumbs: List[str]) -> Tuple[List[str], bool]:
+    """
+    1) Quita tokens vacíos, separadores y 'home/inicio/búsqueda/resultados'
+    2) Colapsa duplicados consecutivos
+    Devuelve (limpios, solo_home_flag)
+    """
+    cleaned = []
+    had_any = False
+    for c in raw_crumbs:
+        if c is None:
+            continue
+        t = str(c).strip()
+        if not t:
+            continue
+        had_any = True
+        if t in {">", "/", "|", "›", "»", "•"}:
+            continue
+        if t.lower() in HOME_NOISE:
+            continue
+        if not cleaned or cleaned[-1] != t:
+            cleaned.append(t)
+    only_noise = (len(cleaned) == 0 and had_any)
+    return cleaned, only_noise
+
+def is_catalogado_from_limpios(crumbs_limpios: List[str]) -> bool:
+    if len(crumbs_limpios) < 2:
+        return False
+    if any(MISC_PAT.search(c) for c in crumbs_limpios):
+        return False
+    return True
+
+# ===== PLP -> PDP =====
 def resolve_first_pdp_url_from_search_html(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
     a = soup.select_one('a[href*="-p"], a[href*="/p/"]')
@@ -290,13 +315,22 @@ def resolve_first_pdp_url_from_search_html(html: str) -> Optional[str]:
     return None
 
 def best_effort_pdp_for_sku(sku: str, use_playwright: bool, session: requests.Session) -> tuple:
+    """
+    Busca el SKU, localiza la PDP y retorna:
+    (pdp_url, pdp_html, crumbs_raw, fuente, modo)
+    modo ∈ {"requests", "playwright", "none"}
+    """
     search_url = DOMAIN.rstrip("/") + SEARCH_PATH.format(q=sku)
+
+    # 1) Intento con requests
     r = session_get(search_url, session=session)
     if r and r.status_code == 200 and r.text:
+        # ¿Redirigió directo a PDP?
         if ("-p" in r.url) or ("/p/" in r.url):
             crumbs, source = extract_any_taxonomy(r.text)
             if crumbs:
                 return r.url, r.text, crumbs, source, "requests"
+        # Si no, parsear PLP y tomar primer PDP
         pdp_url = resolve_first_pdp_url_from_search_html(r.text)
         if pdp_url:
             r2 = session_get(pdp_url, session=session)
@@ -305,6 +339,7 @@ def best_effort_pdp_for_sku(sku: str, use_playwright: bool, session: requests.Se
                 if crumbs:
                     return pdp_url, r2.text, crumbs, source, "requests"
 
+    # 2) Fallback con Playwright
     if use_playwright and pw_available():
         pdp_url, pdp_html = get_pdp_html_via_playwright_from_search(search_url)
         if pdp_url and pdp_html:
@@ -319,28 +354,34 @@ def best_effort_pdp_for_sku(sku: str, use_playwright: bool, session: requests.Se
 
     return None, None, [], "none", "none"
 
-def is_catalogado(crumbs: List[str]) -> bool:
-    if len(crumbs) < 2:
-        return False
-    if any(MISC_PAT.search(c) for c in crumbs):
-        return False
-    return True
-
 def analyze_sku(sku: str, use_playwright: bool, reveal_html_preview: bool=False) -> Dict[str, str]:
     sess = requests.Session()
     sess.headers.update(HEADERS)
 
     for cand in candidate_skus(sku):
-        url, html, crumbs, source, mode = best_effort_pdp_for_sku(cand, use_playwright, sess)
+        url, html, crumbs_raw, source, mode = best_effort_pdp_for_sku(cand, use_playwright, sess)
         if html:
-            cat = "Sí" if is_catalogado(crumbs) else "No"
-            obs = "" if cat == "Sí" else "Faltan niveles/misc o category no clara"
+            crumbs_limpios, solo_home = normalize_crumbs(crumbs_raw)
+            if is_catalogado_from_limpios(crumbs_limpios):
+                catalogado = "Sí"
+                obs = ""
+            else:
+                if solo_home:
+                    obs = "Breadcrumb indica solo Home/Inicio → NO catalogado"
+                elif len(crumbs_limpios) == 1:
+                    obs = "Solo 1 nivel útil en breadcrumb/categoría"
+                else:
+                    obs = "Faltan niveles o hay misc."
+                catalogado = "No"
+
             row = {
                 "SKU": sku,
-                "Catalogado": cat,
-                "Breadcrumb/Category": " > ".join(crumbs),
+                "Catalogado": catalogado,
+                "Breadcrumb_crudo": " > ".join(crumbs_raw),
+                "Breadcrumb_limpio": " > ".join(crumbs_limpios),
                 "FuenteTaxonomía": source,
                 "URL": url or "",
+                "Observación": obs,
                 "Modo": mode,
                 "HTML_len": str(len(html))
             }
@@ -351,9 +392,11 @@ def analyze_sku(sku: str, use_playwright: bool, reveal_html_preview: bool=False)
     return {
         "SKU": sku,
         "Catalogado": "No",
-        "Breadcrumb/Category": "",
+        "Breadcrumb_crudo": "",
+        "Breadcrumb_limpio": "",
         "FuenteTaxonomía": "none",
         "URL": "",
+        "Observación": "No encontrado / sin HTML",
         "Modo": "none",
         "HTML_len": "0",
         "HTML_preview": "" if not reveal_html_preview else ""
@@ -361,7 +404,7 @@ def analyze_sku(sku: str, use_playwright: bool, reveal_html_preview: bool=False)
 
 def to_csv(rows: List[Dict[str, str]]) -> bytes:
     buf = io.StringIO()
-    cols = ["SKU", "Catalogado", "Breadcrumb/Category", "FuenteTaxonomía", "URL", "Modo", "HTML_len"]
+    cols = ["SKU", "Catalogado", "Breadcrumb_crudo", "Breadcrumb_limpio", "FuenteTaxonomía", "URL", "Observación", "Modo", "HTML_len"]
     writer = csv.DictWriter(buf, fieldnames=cols)
     writer.writeheader()
     for r in rows:
@@ -371,7 +414,7 @@ def to_csv(rows: List[Dict[str, str]]) -> bytes:
 # ===== UI =====
 st.set_page_config(page_title="Validador Catalogación simple.ripley.cl", layout="wide")
 st.title("Validador de Catalogación (simple.ripley.cl)")
-st.caption("Buscamos PDP, extraemos breadcrumb/categoría (JSON-LD, microdatos, dataLayer o DOM). Regla: ≥2 niveles y sin 'Otros/Miscel*' = Catalogado.")
+st.caption("Buscamos PDP, extraemos breadcrumb/categoría (JSON-LD, microdatos, dataLayer o DOM). Regla: ≥2 niveles útiles y sin 'Otros/Miscel*' = Catalogado. Si el breadcrumb es solo Home/Inicio → NO catalogado.")
 
 colA, colB = st.columns([3,2], gap="large")
 with colA:
@@ -398,10 +441,9 @@ if run and raw.strip():
             time.sleep(delay)
 
     status.success("Listo ✅")
-    rows = results
 
     st.subheader("Resultados")
-    st.dataframe(rows, use_container_width=True)
+    st.dataframe(results, use_container_width=True)
 
     total = len(results)
     si = sum(1 for r in results if r["Catalogado"] == "Sí")
@@ -414,6 +456,6 @@ if run and raw.strip():
     st.download_button("Descargar CSV (todos)", data=to_csv(results), file_name="catalogacion_simple_ripley.csv", mime="text/csv")
 
     with st.expander("Diagnóstico (avanzado)"):
-        st.write("Revisa Modo, FuenteTaxonomía y HTML_len. Si 'requests' + HTML_len bajo → probablemente contenido via JS (usa Playwright). Si FuenteTaxonomía='none' en PDP, puede que el sitio o el bot-block esté ocultando los datos estructurados.")
-        diag_cols = ["SKU","Modo","FuenteTaxonomía","HTML_len","URL"] + (["HTML_preview"] if reveal else [])
+        st.write("Revisa Modo, FuenteTaxonomía y HTML_len. Si 'requests' + HTML_len bajo → probablemente contenido via JS (usa Playwright). Si FuenteTaxonomía='none' en PDP, el sitio puede estar ocultando datos (sube delay o usa Playwright).")
+        diag_cols = ["SKU","Modo","FuenteTaxonomía","HTML_len","URL","Observación"] + (["HTML_preview"] if reveal else [])
         st.dataframe([{k: r.get(k, "") for k in diag_cols} for r in results], use_container_width=True)
